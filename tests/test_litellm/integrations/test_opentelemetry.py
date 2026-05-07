@@ -545,6 +545,235 @@ class TestOpenTelemetryCaptureMessageContent(unittest.TestCase):
         self.assertTrue(kept._capture_in_event())
 
 
+class TestOpenTelemetrySemconvStability(unittest.TestCase):
+    """OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental opts into
+    semconv-conformant span shape (name, kind, no raw_gen_ai_request child)."""
+
+    @staticmethod
+    def _make(env=None, config_value=None):
+        env_value = env if env is not None else ""
+        with patch.dict(os.environ, {"OTEL_SEMCONV_STABILITY_OPT_IN": env_value}):
+            return OpenTelemetry(
+                config=OpenTelemetryConfig(
+                    exporter="console",
+                    semconv_stability=config_value,
+                )
+            )
+
+    def test_default_unset_keeps_legacy_span_name(self):
+        h = self._make()
+        self.assertFalse(h._gen_ai_semconv_latest_experimental)
+        kwargs = {"model": "gpt-4", "call_type": "acompletion"}
+        self.assertEqual(h._get_span_name(kwargs), "litellm_request")
+
+    def test_opt_in_emits_semconv_span_name(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        self.assertTrue(h._gen_ai_semconv_latest_experimental)
+        kwargs = {"model": "gpt-4", "call_type": "acompletion"}
+        self.assertEqual(h._get_span_name(kwargs), "chat gpt-4")
+
+    def test_opt_in_supports_comma_separated_categories(self):
+        h = self._make(env="other_category,gen_ai_latest_experimental")
+        self.assertTrue(h._gen_ai_semconv_latest_experimental)
+
+    def test_opt_in_ignores_unrelated_category(self):
+        h = self._make(env="some_other_category")
+        self.assertFalse(h._gen_ai_semconv_latest_experimental)
+
+    def test_config_field_overrides_env(self):
+        h = self._make(env="", config_value="gen_ai_latest_experimental")
+        self.assertTrue(h._gen_ai_semconv_latest_experimental)
+
+    def test_operation_name_for_embeddings(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        kwargs = {
+            "model": "text-embedding-3-small",
+            "call_type": "aembedding",
+        }
+        self.assertEqual(h._get_span_name(kwargs), "embeddings text-embedding-3-small")
+
+    def test_operation_name_for_text_completion(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        kwargs = {"model": "babbage-002", "call_type": "atext_completion"}
+        self.assertEqual(h._get_span_name(kwargs), "text_completion babbage-002")
+
+    def test_operation_name_defaults_to_chat(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        kwargs = {"model": "claude-sonnet-4-5", "call_type": "unknown"}
+        self.assertEqual(h._get_span_name(kwargs), "chat claude-sonnet-4-5")
+
+    def test_generation_name_metadata_overrides_semconv_name(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        kwargs = {
+            "model": "gpt-4",
+            "call_type": "acompletion",
+            "litellm_params": {"metadata": {"generation_name": "user-named-span"}},
+        }
+        self.assertEqual(h._get_span_name(kwargs), "user-named-span")
+
+    def test_opt_in_skips_raw_gen_ai_request_span(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        h._maybe_log_raw_request = OpenTelemetry._maybe_log_raw_request.__get__(h)
+        h.tracer = MagicMock()
+        h.set_raw_request_attributes = MagicMock()
+        kwargs = {"litellm_params": {"metadata": {}}}
+        h._maybe_log_raw_request(kwargs, {}, None, None, MagicMock())
+        h.tracer.start_span.assert_not_called()
+
+    def test_semconv_request_attributes_emit_when_present(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        optional_params = {
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.2,
+            "top_k": 40,
+            "seed": 42,
+            "stop": ["\n\n"],
+            "stream": True,
+            "n": 3,
+        }
+        h._set_semconv_request_attributes(span, optional_params)
+        calls = {
+            c.args[0] if c.args else c.kwargs.get("key"): c
+            for c in span.set_attribute.call_args_list
+        }
+        self.assertIn("gen_ai.request.frequency_penalty", calls)
+        self.assertIn("gen_ai.request.presence_penalty", calls)
+        self.assertIn("gen_ai.request.top_k", calls)
+        self.assertIn("gen_ai.request.seed", calls)
+        self.assertIn("gen_ai.request.stop_sequences", calls)
+        self.assertIn("gen_ai.request.stream", calls)
+        self.assertIn("gen_ai.request.choice.count", calls)
+
+    def test_semconv_request_choice_count_omitted_when_one(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        h._set_semconv_request_attributes(span, {"n": 1})
+        keys = {c.args[0] for c in span.set_attribute.call_args_list if c.args}
+        self.assertNotIn("gen_ai.request.choice.count", keys)
+
+    def test_semconv_request_stream_emitted_as_bool(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        h._set_semconv_request_attributes(span, {"stream": False})
+        stream_calls = [
+            c
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == "gen_ai.request.stream"
+        ]
+        self.assertEqual(len(stream_calls), 1)
+        self.assertEqual(stream_calls[0].args[1], False)
+
+    def test_semconv_request_stop_sequences_normalizes_string_to_list(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        h._set_semconv_request_attributes(span, {"stop": "STOP_TOKEN"})
+        # safe_dumps(["STOP_TOKEN"]) == '["STOP_TOKEN"]'
+        stop_calls = [
+            c
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == "gen_ai.request.stop_sequences"
+        ]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertIn("STOP_TOKEN", stop_calls[0].args[1])
+
+    def test_semconv_cache_token_attributes(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        std_log = {
+            "metadata": {
+                "usage_object": {
+                    "cache_creation_input_tokens": 12,
+                    "cache_read_input_tokens": 34,
+                }
+            }
+        }
+        h._set_semconv_cache_token_attributes(span, std_log)
+        keys = {
+            c.args[0]: c.args[1] for c in span.set_attribute.call_args_list if c.args
+        }
+        self.assertEqual(keys.get("gen_ai.usage.cache_creation.input_tokens"), 12)
+        self.assertEqual(keys.get("gen_ai.usage.cache_read.input_tokens"), 34)
+
+    def test_semconv_cache_token_attributes_handles_none_metadata(self):
+        # standard_logging_payload["metadata"] = None should not crash.
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        h._set_semconv_cache_token_attributes(span, {"metadata": None})
+        span.set_attribute.assert_not_called()
+
+    def test_semconv_cache_token_attributes_omitted_when_zero(self):
+        h = self._make(env="gen_ai_latest_experimental")
+        span = MagicMock()
+        std_log = {
+            "metadata": {
+                "usage_object": {
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            }
+        }
+        h._set_semconv_cache_token_attributes(span, std_log)
+        keys = {c.args[0] for c in span.set_attribute.call_args_list if c.args}
+        self.assertNotIn("gen_ai.usage.cache_creation.input_tokens", keys)
+        self.assertNotIn("gen_ai.usage.cache_read.input_tokens", keys)
+
+    def test_opt_in_emits_consolidated_inference_details_event(self):
+        from opentelemetry import _logs
+        from opentelemetry._logs._internal import ProxyLoggerProvider
+
+        log_exporter = InMemoryLogExporter()
+        # Make _init_logs see a non-SDK global (the proxy default) so it
+        # falls into the create_new branch and consults _get_log_exporter,
+        # which we patch to return our in-memory exporter.
+        with (
+            patch.dict(
+                os.environ,
+                {"OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental"},
+            ),
+            patch.object(
+                _logs, "get_logger_provider", return_value=ProxyLoggerProvider()
+            ),
+            patch.object(_logs, "set_logger_provider"),
+            patch.object(OpenTelemetry, "_get_log_exporter", return_value=log_exporter),
+        ):
+            h = OpenTelemetry(
+                config=OpenTelemetryConfig(exporter="console", enable_events=True)
+            )
+        h.message_logging = True
+
+        kwargs = {
+            "model": "gpt-4",
+            "call_type": "acompletion",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {"custom_llm_provider": "openai"},
+        }
+        response_obj = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        span = h.tracer.start_span("test")
+        h._emit_semantic_logs(kwargs, response_obj, span)
+        span.end()
+        h._logger_provider.force_flush(2000)
+
+        records = [r.log_record for r in log_exporter.get_finished_logs()]
+        # Exactly ONE inference details event, not the legacy per-message/choice pair.
+        self.assertEqual(len(records), 1)
+        attrs = dict(records[0].attributes or {})
+        self.assertEqual(
+            attrs["event_name"], "gen_ai.client.inference.operation.details"
+        )
+        self.assertEqual(attrs["gen_ai.provider.name"], "openai")
+        self.assertEqual(attrs["gen_ai.operation.name"], "chat")
+        self.assertIn("gen_ai.input.messages", attrs)
+        self.assertIn("gen_ai.output.messages", attrs)
+
+
 class TestOpenTelemetry(unittest.TestCase):
     POLL_INTERVAL = 0.05
     POLL_TIMEOUT = 2.0
