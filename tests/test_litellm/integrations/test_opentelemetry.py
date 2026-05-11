@@ -773,6 +773,56 @@ class TestOpenTelemetrySemconvStability(unittest.TestCase):
         self.assertIn("gen_ai.input.messages", attrs)
         self.assertIn("gen_ai.output.messages", attrs)
 
+    def test_opt_in_inference_details_respects_content_kill_switch(self):
+        from opentelemetry import _logs
+        from opentelemetry._logs._internal import ProxyLoggerProvider
+
+        log_exporter = InMemoryLogExporter()
+        with (
+            patch.dict(
+                os.environ,
+                {"OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental"},
+            ),
+            patch("litellm.turn_off_message_logging", True),
+            patch.object(
+                _logs, "get_logger_provider", return_value=ProxyLoggerProvider()
+            ),
+            patch.object(_logs, "set_logger_provider"),
+            patch.object(OpenTelemetry, "_get_log_exporter", return_value=log_exporter),
+        ):
+            h = OpenTelemetry(
+                config=OpenTelemetryConfig(exporter="console", enable_events=True)
+            )
+            h.message_logging = True
+
+            kwargs = {
+                "model": "gpt-4",
+                "call_type": "acompletion",
+                "messages": [{"role": "user", "content": "private prompt"}],
+                "litellm_params": {"custom_llm_provider": "openai"},
+            }
+            response_obj = {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "private completion",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+            span = h.tracer.start_span("test")
+            h._emit_semantic_logs(kwargs, response_obj, span)
+            span.end()
+            h._logger_provider.force_flush(2000)
+
+        records = [r.log_record for r in log_exporter.get_finished_logs()]
+        self.assertEqual(len(records), 1)
+        attrs = dict(records[0].attributes or {})
+        self.assertNotIn("gen_ai.input.messages", attrs)
+        self.assertNotIn("gen_ai.output.messages", attrs)
+
 
 class TestOpenTelemetry(unittest.TestCase):
     POLL_INTERVAL = 0.05

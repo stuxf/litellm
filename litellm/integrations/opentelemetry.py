@@ -469,7 +469,7 @@ class OpenTelemetry(CustomLogger):
             "gen_ai.operation.name": self._gen_ai_operation_name(kwargs),
         }
 
-        if self.message_logging:
+        if self._capture_in_event():
             input_messages = self._transform_messages_to_otel_semantic_conventions(
                 kwargs.get("messages") or []
             )
